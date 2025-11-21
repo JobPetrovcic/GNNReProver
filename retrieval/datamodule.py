@@ -1,8 +1,18 @@
-"""Datamodule for the premise retrieval."""
+# retrieval/datamodule.py
 
 import os
 import json
 import torch
+
+# Monkeypatch torch.load before Lightning/DeepSpeed calls it
+_orig_load = torch.load
+def patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+
+torch.load = patched_load
+
+
 import random
 import itertools
 from tqdm import tqdm
@@ -11,7 +21,7 @@ from copy import deepcopy
 from lean_dojo import Pos
 import pytorch_lightning as pl
 from lean_dojo import LeanGitRepo
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from transformers import AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 
@@ -29,6 +39,8 @@ class RetrievalDataset(Dataset):
         max_seq_len: int,
         tokenizer,
         is_train: bool,
+        graph_dependencies_config: Optional[Dict[str, Any]],
+        negative_mining_strategy: str = "random",
     ) -> None:
         super().__init__()
         self.corpus = corpus
@@ -37,6 +49,8 @@ class RetrievalDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.tokenizer = tokenizer
         self.is_train = is_train
+        self.graph_dependencies_config = graph_dependencies_config
+        self.negative_mining_strategy = negative_mining_strategy
         self.data = list(
             itertools.chain.from_iterable(self._load_data(path) for path in data_paths)
         )
@@ -55,36 +69,46 @@ class RetrievalDataset(Dataset):
                 all_pos_premises = get_all_pos_premises(
                     tac["annotated_tactic"], self.corpus
                 )
+                
+                lctx_premises_names = set()
+                goal_premises_names = set()
+
+                sig_cfg = self.graph_dependencies_config.get('signature_and_state', {})
+                context_neighbor_verbosity = sig_cfg.get('verbosity', 'verbose')
+
+                if "before_premises" in tac and tac["before_premises"]:
+                    # Each `goal_premises_list` is a list of (premise_name, tag) tuples for one goal.
+                    for goal_premises_list in tac["before_premises"]:
+                        for premise_name, tag in goal_premises_list:
+                            # Filter based on the desired verbosity level ("clickable" or "verbose").
+                            if context_neighbor_verbosity in tag:
+                                # Distinguish between local context and goal premises.
+                                if "lctx" in tag:
+                                    lctx_premises_names.add(premise_name)
+                                elif "goal" in tag:
+                                    goal_premises_names.add(premise_name)
+
+                base_example = {
+                    "url": thm["url"],
+                    "commit": thm["commit"],
+                    "file_path": thm["file_path"],
+                    "full_name": thm["full_name"],
+                    "start": thm["start"],
+                    "tactic_idx": i,
+                    "context": context,
+                    "all_pos_premises": all_pos_premises,
+                    "lctx_premises": list(lctx_premises_names),
+                    "goal_premises": list(goal_premises_names),
+                }
 
                 if self.is_train:
                     # In training, we ignore tactics that do not have any premises.
                     for pos_premise in all_pos_premises:
-                        data.append(
-                            {
-                                "url": thm["url"],
-                                "commit": thm["commit"],
-                                "file_path": thm["file_path"],
-                                "full_name": thm["full_name"],
-                                "start": thm["start"],
-                                "tactic_idx": i,
-                                "context": context,
-                                "pos_premise": pos_premise,
-                                "all_pos_premises": all_pos_premises,
-                            }
-                        )
+                        ex = base_example.copy()
+                        ex["pos_premise"] = pos_premise
+                        data.append(ex)
                 else:
-                    data.append(
-                        {
-                            "url": thm["url"],
-                            "commit": thm["commit"],
-                            "file_path": thm["file_path"],
-                            "full_name": thm["full_name"],
-                            "start": thm["start"],
-                            "tactic_idx": i,
-                            "context": context,
-                            "all_pos_premises": all_pos_premises,
-                        }
-                    )
+                    data.append(base_example)
 
         logger.info(f"Loaded {len(data)} examples.")
         return data
@@ -93,8 +117,10 @@ class RetrievalDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Example:
+        
+
         if not self.is_train:
-            return self.data[idx]
+            return ex
 
         # In-file negatives + random negatives from all accessible premises.
         ex = deepcopy(self.data[idx])
@@ -199,6 +225,8 @@ class RetrievalDataset(Dataset):
 
 
 class RetrievalDataModule(pl.LightningDataModule):
+    corpus: Optional[Corpus]
+    
     def __init__(
         self,
         data_path: str,
@@ -210,6 +238,7 @@ class RetrievalDataModule(pl.LightningDataModule):
         eval_batch_size: int,
         max_seq_len: int,
         num_workers: int,
+        graph_dependencies_config: Dict[str, Any],
     ) -> None:
         super().__init__()
         self.data_path = data_path
@@ -221,16 +250,19 @@ class RetrievalDataModule(pl.LightningDataModule):
         self.max_seq_len = max_seq_len
         self.num_workers = num_workers
 
+        self.graph_dependencies_config = graph_dependencies_config
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.corpus = Corpus(corpus_path)
+        
+        self.corpus = Corpus(corpus_path, graph_dependencies_config)
 
         metadata = json.load(open(os.path.join(data_path, "../metadata.json")))
         repo = LeanGitRepo(**metadata["from_repo"])
-
+    
     def prepare_data(self) -> None:
         pass
 
-    def setup(self, stage: Optional[str] = None) -> None:
+    def setup(self, stage: Optional[str] = None) -> None:    
         self.ds_train = RetrievalDataset(
             [os.path.join(self.data_path, "train.json")],
             self.corpus,
@@ -239,6 +271,7 @@ class RetrievalDataModule(pl.LightningDataModule):
             self.max_seq_len,
             self.tokenizer,
             is_train=True,
+            graph_dependencies_config=self.graph_dependencies_config,
         )
 
         if stage in (None, "fit", "validate"):
@@ -250,6 +283,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
+                graph_dependencies_config=self.graph_dependencies_config,
             )
 
         if stage in (None, "fit", "predict"):
@@ -264,6 +298,7 @@ class RetrievalDataModule(pl.LightningDataModule):
                 self.max_seq_len,
                 self.tokenizer,
                 is_train=False,
+                graph_dependencies_config=self.graph_dependencies_config,
             )
 
     def train_dataloader(self) -> DataLoader:

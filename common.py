@@ -1,3 +1,4 @@
+import collections
 import os
 import re
 import sys
@@ -10,6 +11,7 @@ from loguru import logger
 from lean_dojo import Pos
 import pytorch_lightning as pl
 from dataclasses import dataclass, field
+from torch_geometric.data import Data
 from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict,
 )
@@ -17,6 +19,7 @@ from transformers import get_constant_schedule_with_warmup
 from deepspeed.ops.adam import FusedAdam, DeepSpeedCPUAdam
 from typing import Optional, List, Dict, Any, Tuple, Generator
 from pytorch_lightning.strategies.deepspeed import DeepSpeedStrategy
+from tqdm import tqdm
 
 
 Example = Dict[str, Any]
@@ -24,7 +27,6 @@ Batch = Dict[str, Any]
 
 MARK_START_SYMBOL = "<a>"
 MARK_END_SYMBOL = "</a>"
-
 
 def remove_marks(s: str) -> str:
     """Remove all :code:`<a>` and :code:`</a>` from ``s``."""
@@ -79,6 +81,8 @@ class Premise:
     code: str = field(compare=False)
     """Raw, human-written code for defining the premise.
     """
+
+    dependencies: List[Tuple[str, str]] = field(compare=False, default_factory=list)
 
     def __post_init__(self) -> None:
         assert isinstance(self.path, str)
@@ -167,7 +171,13 @@ class File:
                 continue
             premises.append(
                 Premise(
-                    path, p["full_name"], Pos(*p["start"]), Pos(*p["end"]), p["code"]
+                    path=path,
+                    full_name=p["full_name"],
+                    start=Pos(*p["start"]),
+                    end=Pos(*p["end"]),
+                    code=p["code"],
+                    # Read from the unified dependencies key
+                    dependencies=p["dependencies"],
                 )
             )
         return cls(path, premises)
@@ -176,6 +186,38 @@ class File:
     def is_empty(self) -> bool:
         """Check whether the file contains no premise."""
         return self.premises == []
+
+
+def _get_edge_type_name_from_tag(tag: str, config: Dict[str, Any]) -> Optional[str]:
+    """
+    Determines the edge type name based on a dependency tag and a configuration dictionary.
+    Returns None if the edge should be filtered out.
+    """
+    mode = config.get('mode', 'custom')
+    edge_type_name = None
+
+    if mode == 'all_dojo':
+        if tag == 'all_dojo':
+            edge_type_name = 'dependency'
+    else:  # Custom mode
+        sig_cfg = config.get('signature_and_state', {})
+        verbosity = sig_cfg.get('verbosity', 'verbose')
+        distinguish = sig_cfg.get('distinguish_lctx_goal', False)
+        use_proof = config.get('use_proof_dependencies', False)
+
+        if use_proof and tag == 'proof':
+            edge_type_name = 'proof'
+        elif 'signature' in tag:
+            if tag.startswith(f"signature_{verbosity}"):
+                if distinguish:
+                    # e.g., from "signature_clickable_lctx" get "signature_lctx"
+                    edge_type_name = tag.replace(f"signature_{verbosity}_", 'signature_')
+                else:
+                    edge_type_name = 'signature'
+            elif verbosity == 'dojo' and tag == 'signature_dojo':
+                edge_type_name = 'signature'
+    
+    return edge_type_name
 
 
 class Corpus:
@@ -191,32 +233,92 @@ class Corpus:
     all_premises: List[Premise]
     """All premises in the entire corpus.
     """
+    premise_dep_graph: Data
+    dojo_graph : Data
+    uid2idx: Dict[Tuple[str, int, int], int]
 
-    def __init__(self, jsonl_path: str) -> None:
+    def __init__(self, jsonl_path: str, graph_config: Dict[str, Any]) -> None:
         """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
         dep_graph = nx.DiGraph()
-        self.all_premises = []
-
         logger.info(f"Building the corpus from {jsonl_path}")
 
+        """Construct a :class:`Corpus` object from a ``corpus.jsonl`` data file."""
+        dep_graph = nx.DiGraph()
+        
+        logger.info(f"Building the corpus from {jsonl_path}")
+
+        # ======================== START OF ROBUST MERGING FIX ========================
+        
+        # Step 1: Ingest all data, building the file graph and collecting all premises.
+        all_premises_with_duplicates = []
         for line in open(jsonl_path):
             file_data = json.loads(line)
             path = file_data["path"]
             assert not dep_graph.has_node(path)
+            
+            #if not dep_graph.has_node(path):
             file = File.from_data(file_data)
-
             dep_graph.add_node(path, file=file)
-            self.all_premises.extend(file.premises)
+            all_premises_with_duplicates.extend(file.premises)
 
-            for p in file_data["imports"]:
-                assert dep_graph.has_node(p)
-                dep_graph.add_edge(path, p)
+            for p_import in file_data["imports"]:
+                assert dep_graph.has_node(p_import)
+                dep_graph.add_edge(path, p_import)
+        
+        unique_premises_dict = {p.full_name: p for p in all_premises_with_duplicates}
+        self.all_premises = list(unique_premises_dict.values())
+        print(f"Removed duplicates: start {len(all_premises_with_duplicates)} end {len(self.all_premises)}")
+        
 
         assert nx.is_directed_acyclic_graph(dep_graph)
         self.transitive_dep_graph = nx.transitive_closure_dag(dep_graph)
 
+        self.name2idx = {p.full_name: i for i, p in enumerate(self.all_premises)}
+        # Pass the config to the graph builder
+        self._build_premise_dependency_graph(graph_config)
+
         self.imported_premises_cache = {}
         self.fill_cache()
+
+    def _build_premise_dependency_graph(self, config: Dict[str, Any]) -> None:
+        """Builds the premise dependency graph based on the provided configuration."""
+        logger.info(f"Building premise dependency graph with config: {config}")
+        
+        edges = []
+        edge_types_map = {}
+        
+        def get_edge_type_id(edge_name : str) -> int:
+            if edge_name not in edge_types_map:
+                edge_types_map[edge_name] = len(edge_types_map)
+            return edge_types_map[edge_name]
+
+        for p1 in self.all_premises:
+            assert p1.full_name in self.name2idx, f"Premise {p1.full_name} not found in name2idx"
+            p1_idx = self.name2idx[p1.full_name]
+
+            for p2_name, tag in p1.dependencies:
+                if p2_name not in self.name2idx or p1_idx == self.name2idx[p2_name]:
+                    continue
+                p2_idx = self.name2idx[p2_name]
+
+                edge_type_name = _get_edge_type_name_from_tag(tag, config)
+                
+                if edge_type_name:
+                    edge_type_id = get_edge_type_id(edge_type_name)
+                    edges.append((p2_idx, p1_idx, edge_type_id))
+
+        # Store the mapping for the GNN model
+        self.edge_types_map = edge_types_map 
+        self.edge_types = {v: k for k, v in edge_types_map.items()}
+        logger.info(f"Final edge types used in graph: {self.edge_types}")
+
+        # --- Graph Construction ---
+        unique_edges = sorted(list(set(edges)))
+        edge_index = torch.tensor([[e[0] for e in unique_edges], [e[1] for e in unique_edges]], dtype=torch.long)
+        edge_attr = torch.tensor([e[2] for e in unique_edges], dtype=torch.long)
+
+        self.premise_dep_graph = Data(edge_index=edge_index, edge_attr=edge_attr, num_nodes=len(self.all_premises))
+        logger.info(f"Premise dependency graph: {self.premise_dep_graph}")
 
     def _get_file(self, path: str) -> File:
         return self.transitive_dep_graph.nodes[path]["file"]
@@ -295,7 +397,6 @@ class Corpus:
             if (p.path == path and p.end <= pos)
             or self.transitive_dep_graph.has_edge(path, p.path)
         ]
-
     def get_nearest_premises(
         self,
         premise_embeddings: torch.FloatTensor,
@@ -304,7 +405,7 @@ class Corpus:
         k: int,
     ) -> Tuple[List[List[Premise]], List[List[float]]]:
         """Perform a batch of nearest neighbour search."""
-        similarities = batch_context_emb @ premise_embeddings.t()
+        similarities = batch_context_emb @ premise_embeddings.to(batch_context_emb.dtype).t()
         idxs_batch = similarities.argsort(dim=1, descending=True).tolist()
         results = [[] for _ in batch_context]
         scores = [[] for _ in batch_context]
@@ -349,7 +450,8 @@ def get_all_pos_premises(annot_tac, corpus: Corpus) -> List[Premise]:
         if p is not None:
             all_pos_premises.add(p)
         else:
-            logger.warning(f"Cannot locate premise: {prov}")
+            # logger.warning(f"Cannot locate premise: {prov}")
+            pass
 
     return list(all_pos_premises)
 
