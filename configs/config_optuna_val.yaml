@@ -1,0 +1,54 @@
+use_random_embeddings: true
+undirected_graphs: false
+debug: false
+
+gnn_premises:
+  hidden_size: 512
+  n_layers: 1
+  layer_type: "RGCN"
+  n_relations: 3
+  normalization: "l2"
+  activation: "relu"
+  dropout: 0.27089886580352
+  edge_dropout: 0.01136869889838458
+  residual: true
+
+gnn_contexts:
+  hidden_size: 512
+  n_layers: 1
+  layer_type: "RGCN"
+  n_relations: 3
+  normalization: "layernorm"
+  activation: "relu"
+  dropout: 0.39282313410615444
+  edge_dropout: 0.05684273833549255
+  residual: true
+
+loss:
+  weigh_by_class: false
+  loss_function: "info_nce"
+  temperature: 1.0
+
+negative_sampler:
+  sampler: "all"
+  #n_negatives_per_context: 3
+  scorer:
+    preprocess:
+      type: "none"
+    aggregation: "mean"
+    heads: 1
+    learn_temperature: false
+
+optimizer:
+  lr: 0.0016751081027043108
+  weight_decay: 4.607876883553767e-05
+
+training:
+  epochs: 94
+  batch_size: 1024
+  gradient_accumulation_steps: 1
+  ema_decay: 0.999
+
+evaluation:
+  batch_size: 1024
+  eval_every_n_epochs: 10
