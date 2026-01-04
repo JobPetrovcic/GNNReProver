@@ -105,7 +105,7 @@ class LightweightGraphDataset:
         Loads or creates the dataset where each "context" node corresponds to a
         tactic instance, not a unique proof state.
         """
-        instance_save_dir = save_dir + "_instances"
+        instance_save_dir = save_dir
         os.makedirs(instance_save_dir, exist_ok=True)
         filenames = {
             "premise_embeddings.pt", "premise_edge_index.pt", "premise_edge_attr.pt",
@@ -122,6 +122,8 @@ class LightweightGraphDataset:
             data_dict = { k.replace('.pt', ''): torch.load(os.path.join(instance_save_dir, k)) for k in filenames }
             return cls(**data_dict)
         else:
+            assert False
+            
             logger.info("Cached instance-based dataset not found. Creating from source...")
             if not all([data_path, corpus_path, retriever_ckpt_path, gnn_config]):
                 raise ValueError("All source data paths and config must be provided for first-time creation.")
@@ -227,7 +229,7 @@ class LightweightGraphDataset:
         premise_idx_to_name_map = [p.full_name for p in corpus.all_premises]
         premise_pos_data = [[p.start.line_nb, p.start.column_nb, p.end.line_nb, p.end.column_nb] for p in corpus.all_premises]
         premise_pos = torch.tensor(premise_pos_data, dtype=torch.long)
-        edge_types_map = corpus.edge_types_map
+        edge_types_map: Dict[str, int] = corpus.edge_types_map
 
         # Build Dense File Dependency Matrix
         file_paths = sorted(list(corpus.transitive_dep_graph.nodes()))
@@ -255,8 +257,11 @@ class LightweightGraphDataset:
         context_theorem_pos = torch.full((num_instances, 2), -1, dtype=torch.long)
 
         # For edges and labels
-        src_edges, dst_edges, attr_edges = [], [], []
-        label_ctx_indices, label_p_indices = [], []
+        src_edges: List[int] = []
+        dst_edges: List[int] = []
+        attr_edges: List[int] = []
+        label_ctx_indices: List[int] = []
+        label_p_indices: List[int] = []
         lctx_id = edge_types_map.get('signature_lctx')
         goal_id = edge_types_map.get('signature_goal')
 
@@ -266,7 +271,7 @@ class LightweightGraphDataset:
             context_embeddings[i] = context_embeddings_dict[context_str]
 
             # 2. Map this instance to its file index and theorem position
-            context_to_file_idx_map[i] = path_to_file_idx.get(ex["context"].path, -1)
+            context_to_file_idx_map[i] = path_to_file_idx[ex["context"].path]
             context_theorem_pos[i] = torch.tensor((ex["context"].theorem_pos.line_nb, ex["context"].theorem_pos.column_nb), dtype=torch.long)
 
             # 3. Build context edges (p -> instance)
@@ -309,7 +314,7 @@ class LightweightGraphDataset:
 
         # --- Save Data ---
         logger.info(f"Saving processed instance-based data to {save_dir}...")
-        data_to_save = {
+        data_to_save: Dict[str, Any] = {
             "premise_embeddings": premise_embeddings, "premise_edge_index": premise_edge_index, "premise_edge_attr": premise_edge_attr,
             "context_embeddings": context_embeddings, "context_edge_index": context_edge_index, "context_edge_attr": context_edge_attr,
             "context_premise_labels": context_premise_labels, "train_mask": train_mask, "val_mask": val_mask, "test_mask": test_mask,
@@ -319,7 +324,7 @@ class LightweightGraphDataset:
             "premise_pos": premise_pos, "context_theorem_pos": context_theorem_pos,
         }
         for name, data in data_to_save.items():
-            torch.save(data, os.path.join(save_dir, f"{name}.pt"))
+            torch.save(data, os.path.join(save_dir, f"{name}.pt")) # type: ignore
         return data_to_save
 
 
@@ -331,9 +336,9 @@ def main() -> None:
     parser.add_argument("--retriever_ckpt_path", type=str, default="kaiyuy/leandojo-lean4-retriever-byt5-small", help="Path to the retriever model. Required for first run.")
     args = parser.parse_args()
 
-    gnn_config = {
-        'mode': 'custom', 'use_proof_dependencies': True,
-        'signature_and_state': {'verbosity': 'clickable', 'distinguish_lctx_goal': True}
+    gnn_config : Dict[str, Any] = {
+        'mode': 'custom', 'use_proof_dependencies': False,
+        'signature_and_state': {'verbosity': 'verbose', 'distinguish_lctx_goal': True}
     }
 
     dataset = LightweightGraphDataset.load_or_create(

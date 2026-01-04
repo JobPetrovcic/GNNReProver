@@ -130,3 +130,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+verbose/
+*.html
+*.lprof
+*.png
+*.jpg
+*.jpeg
+*.db
+lightweight_test.py
+wandb
+weights
