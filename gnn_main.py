@@ -5,7 +5,7 @@ import warnings
 import wandb
 import torch
 from torch import Tensor
-from torch_geometric.nn import RGCNConv, RGATConv, GATConv, GCNConv # type: ignore
+from torch_geometric.nn import RGCNConv, RGATConv, GATConv, GCNConv, GraphNorm, JumpingKnowledge # type: ignore
 from typing import Callable, Dict, Any, List, Literal, Tuple, Optional, Union
 import copy
 from tqdm import tqdm
@@ -88,9 +88,15 @@ class GNN(torch.nn.Module):
                 norm = torch.nn.LayerNorm(hidden_size)
             elif norm_type in ['l2']:
                 norm = L2Norm()
+            elif norm_type in ['graphnorm', 'graph']:
+                norm = GraphNorm(hidden_size)
             else:
                 norm = torch.nn.Identity()
             self.norms.append(norm)
+
+        self.jk_mode = config.get('jumping_knowledge', 'none')
+        if self.jk_mode != 'none':
+            self.jk = JumpingKnowledge(mode=self.jk_mode, channels=hidden_size, num_layers=config['n_layers'])
 
         if self.config['residual'] and input_size != hidden_size:
             self.residual_projection = torch.nn.Linear(input_size, hidden_size)
@@ -106,17 +112,29 @@ class GNN(torch.nn.Module):
         if self.config['n_layers'] == 0:
             return self.input_projection(x)
 
+        xs : list[Tensor] = []
+        res_position = self.config.get('res_position', 'postnorm')
+
         for i, (conv, norm) in enumerate(zip(self.convs, self.norms)):
             x_res = x
+
+            if res_position == 'prenorm':
+                x = norm(x)
+
             if isinstance(conv, (RGCNConv, RGATConv)):
                 x = conv(x, edge_index, edge_type)
             else:
                 x = conv(x, edge_index)
 
-            if self.config['activation'] == 'relu':
+            act = self.config['activation']
+            if act == 'relu':
                 x = torch.relu(x)
-            elif self.config['activation'] == 'gelu':
+            elif act == 'gelu':
                 x = torch.nn.functional.gelu(x)
+            elif act == 'swish':
+                x = torch.nn.functional.silu(x)
+            elif act == 'elu':
+                x = torch.nn.functional.elu(x)
 
             if self.config.get("debug", False) and self.training:
                 dead_neurons = (x == 0).float().mean().item()
@@ -139,7 +157,14 @@ class GNN(torch.nn.Module):
                     x_res = self.residual_projection(x_res)
                 x = x + x_res
 
-            x = norm(x)
+            if res_position == 'postnorm':
+                x = norm(x)
+            
+            if self.jk_mode != 'none':
+                xs.append(x)
+        
+        if self.jk_mode != 'none':
+            x = self.jk(xs)
                 
         return x
     
@@ -1071,32 +1096,40 @@ def objective(trial: optuna.Trial, base_config: Dict[str, Any], base_dataset: Li
     
     config = copy.deepcopy(base_config)
     
-    config["gnn_premises"]["n_layers"] = trial.suggest_int("gnn_premises_n_layers", 0, 3)
-    config["gnn_premises"]["normalization"] = trial.suggest_categorical("gnn_premises_normalization", ["none", "batchnorm", "layernorm", "l2"])
-    config["gnn_premises"]["dropout"] = trial.suggest_float("gnn_premises_dropout", 0.0, 0.5)
-    config["gnn_premises"]["edge_dropout"] = trial.suggest_float("gnn_premises_edge_dropout", 0.0, 0.5)
-    config["gnn_premises"]["hidden_size"] = trial.suggest_categorical("gnn_s_hidden_size", [64, 128, 256, 512])
+    hidden_size = trial.suggest_categorical("gnn_hidden_size", [256, 512, 768])
 
-    config["gnn_contexts"]["n_layers"] = trial.suggest_int("gnn_contexts_n_layers", 0, 3)
-    config["gnn_contexts"]["normalization"] = trial.suggest_categorical("gnn_contexts_normalization", ["none", "batchnorm", "layernorm", "l2"])
-    config["gnn_contexts"]["dropout"] = trial.suggest_float("gnn_contexts_dropout", 0.0, 0.5)
-    config["gnn_contexts"]["edge_dropout"] = trial.suggest_float("gnn_contexts_edge_dropout", 0.0, 0.5)
-    config["gnn_contexts"]["hidden_size"] = trial.suggest_categorical("gnn_s_hidden_size", [64, 128, 256, 512])
+    config["gnn_premises"]["n_layers"] = trial.suggest_int("gnn_premises_n_layers", 1, 3)
+    config["gnn_premises"]["normalization"] = trial.suggest_categorical("gnn_premises_normalization", ["none", "batchnorm", "layernorm", "l2", "graphnorm"])
+    config["gnn_premises"]["activation"] = trial.suggest_categorical("gnn_premises_activation", ["relu", "gelu", "swish", "elu"])
+    config["gnn_premises"]["res_position"] = trial.suggest_categorical("gnn_premises_res_position", ["prenorm", "postnorm"])
+    config["gnn_premises"]["jumping_knowledge"] = trial.suggest_categorical("gnn_premises_jumping_knowledge", ["none", "max"])
+    config["gnn_premises"]["dropout"] = trial.suggest_float("gnn_premises_dropout", 0.1, 0.4)
+    config["gnn_premises"]["edge_dropout"] = trial.suggest_float("gnn_premises_edge_dropout", 0.0, 0.2)
+    config["gnn_premises"]["hidden_size"] = hidden_size
+
+    config["gnn_contexts"]["n_layers"] = trial.suggest_int("gnn_contexts_n_layers", 1, 3)
+    config["gnn_contexts"]["normalization"] = trial.suggest_categorical("gnn_contexts_normalization", ["none", "batchnorm", "layernorm", "l2", "graphnorm"])
+    config["gnn_contexts"]["activation"] = trial.suggest_categorical("gnn_contexts_activation", ["relu", "gelu", "swish", "elu"])
+    config["gnn_contexts"]["res_position"] = trial.suggest_categorical("gnn_contexts_res_position", ["prenorm", "postnorm"])
+    config["gnn_contexts"]["jumping_knowledge"] = trial.suggest_categorical("gnn_contexts_jumping_knowledge", ["none", "max"])
+    config["gnn_contexts"]["dropout"] = trial.suggest_float("gnn_contexts_dropout", 0.2, 0.5)
+    config["gnn_contexts"]["edge_dropout"] = trial.suggest_float("gnn_contexts_edge_dropout", 0.0, 0.2)
+    config["gnn_contexts"]["hidden_size"] = hidden_size
 
     config["negative_sampler"]["scorer"]["learn_temperature"] = trial.suggest_categorical("learn_temperature", [True, False])
 
-    config["training"]["epochs"] = trial.suggest_int("training_epochs", 1, 100)
+    config["training"]["epochs"] = trial.suggest_int("training_epochs", 50, 100)
     
     
-    config["optimizer"]["lr"] = trial.suggest_float("lr", 0.000001, 0.01, log=True)
-    config["optimizer"]["weight_decay"] = trial.suggest_float("weight_decay", 0.000001, 0.01, log=True)
+    config["optimizer"]["lr"] = trial.suggest_float("lr", 0.0001, 0.01, log=True)
+    config["optimizer"]["weight_decay"] = trial.suggest_float("weight_decay", 0.00001, 0.001, log=True)
     
-    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [128, 256, 512, 1024])
+    config["training"]["batch_size"] = trial.suggest_categorical("batch_size", [512, 1024])
 
     dataset = copy.deepcopy(base_dataset).to(device=torch.device(f"cuda:{gpu_id}"))
     
     try:
-        metrics = run_experiment(dataset, config, gpu_id, None, time_limit=3600 * 3)
+        metrics = run_experiment(dataset, config, gpu_id, None, time_limit=3600 * 5)
         val_metrics = metrics["val_metrics"]
         train_metrics = metrics["train_metrics"]
         test_metrics = metrics["test_metrics"]
@@ -1397,16 +1430,16 @@ def load_config(config_path: str) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     dataset = load_dataset()
-    #config = load_config("configs/config.yaml")
-    #config["data_config"] = get_data_config(dataset)
-    #study_name = "optuna_after_overfitting_study"
-    #optune(config, dataset, gpu_ids=[1, 2, 3], storage=f"sqlite:///{study_name}.db", study_name=study_name)
-
-    path = "weights/pure_gnn_retrieval_model.pt"
-    config = load_config("configs/config_optuna_val.yaml")
+    config = load_config("configs/config_optuna_more_options.yaml")
     config["data_config"] = get_data_config(dataset)
-    gpu_id = 3
-    dataset.to(device=torch.device(f"cuda:{gpu_id}"))
+    study_name = "val_optuna_more_options"
+    optune(config, dataset, gpu_ids=[0, 1, 2, 3], storage=f"sqlite:///{study_name}.db", study_name=study_name)
+
+    #path = "weights/pure_gnn_retrieval_model.pt"
+    #config = load_config("configs/config_optuna_val.yaml")
+    #config["data_config"] = get_data_config(dataset)
+    #gpu_id = 3
+    #dataset.to(device=torch.device(f"cuda:{gpu_id}"))
 
     #run_baseline(dataset, config, gpu_id)
 
@@ -1416,11 +1449,11 @@ if __name__ == "__main__":
     
     #run_diagnose(dataset, config, gpu_id, path)
 
-    gpu_ids = list(range(torch.cuda.device_count()))
-    if not gpu_ids:
-        gpu_ids = [0]
+    #gpu_ids = list(range(torch.cuda.device_count()))
+    #if not gpu_ids:
+    #    gpu_ids = [0]
     
     # Ensure dataset is on CPU before spawning processes to avoid CUDA context issues
-    dataset.to(torch.device("cpu"))
+    #dataset.to(torch.device("cpu"))
     
-    run_ensemble(dataset, config, gpu_ids=gpu_ids, n_models=12, train=False)
+    #run_ensemble(dataset, config, gpu_ids=gpu_ids, n_models=12, train=False)
